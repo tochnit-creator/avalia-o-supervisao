@@ -8,6 +8,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
 <style>
   :root{
     --bg:#EEF1F4;
@@ -78,6 +79,26 @@
 
   .sidebar-foot{margin-top:auto;padding:14px 10px 4px 10px;border-top:1px solid rgba(255,255,255,.08);font-size:11.5px;color:#697680;line-height:1.5;}
   .sidebar-foot b{color:#9FADB8;}
+
+  #sync-panel{margin-top:auto;padding:12px 10px;border-top:1px solid rgba(255,255,255,.08);}
+  .sync-pill{display:flex;align-items:center;gap:7px;font-size:12px;font-weight:700;margin-bottom:8px;}
+  .sync-dot{width:8px;height:8px;border-radius:50%;flex:none;}
+  .sync-dot.on{background:#3FAE93;box-shadow:0 0 0 3px rgba(63,174,147,.25);}
+  .sync-dot.off{background:#B7C1CA;}
+  .sync-dot.err{background:#D3705F;box-shadow:0 0 0 3px rgba(211,112,95,.25);}
+  .sync-pill.on{color:#8FE0C8;}
+  .sync-pill.off{color:#9AA6B0;}
+  .sync-pill.err{color:#F0B4A8;}
+  .sync-note{font-size:11px;color:#697680;line-height:1.5;margin-bottom:10px;}
+  .sync-actions{display:flex;flex-direction:column;gap:6px;}
+  .sync-btn{
+    display:flex;align-items:center;justify-content:center;gap:6px;width:100%;padding:8px 10px;border-radius:8px;
+    font-size:12px;font-weight:700;cursor:pointer;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.04);color:#E7EBEE;
+  }
+  .sync-btn:hover{background:rgba(255,255,255,.09);}
+  .sync-btn.primary{background:var(--accent);border-color:var(--accent);}
+  .sync-btn.primary:hover{background:var(--accent-dark);}
+  .sync-btn svg{width:13px;height:13px;stroke:currentColor;flex:none;}
 
   .main{flex:1;min-width:0;display:flex;flex-direction:column;}
   .topbar{
@@ -326,10 +347,8 @@
         Colaboradores
       </button>
     </div>
-    <div class="nav-section-label">Protótipo</div>
-    <div class="sidebar-foot">
-      <b>Versão de demonstração.</b><br>Os dados ficam apenas nesta sessão do navegador. Pronto para conexão futura com Supabase.
-    </div>
+    <div class="nav-section-label">Fonte de dados</div>
+    <div id="sync-panel"></div>
   </aside>
 
   <div class="main">
@@ -364,7 +383,6 @@
 </div>
 
 <div id="modal-root"></div>
-<input type="file" id="hidden-photo-input" accept="image/*" style="display:none" onchange="handlePhotoFile(event)">
 
 <script>
 /* =====================================================================
@@ -626,9 +644,175 @@ const EMPLOYEES = [
    ESTADO DA APLICAÇÃO
    ===================================================================== */
 
-const state = { employees: EMPLOYEES, view:'overview', currentId:null, search:'', filterArea:'todas', filterStatus:'todos' };
+const state = {
+  employees: EMPLOYEES, view:'overview', currentId:null, search:'', filterArea:'todas', filterStatus:'todos',
+  dataSource:'demo', lastSync:null, syncError:null, syncing:false,
+};
 let radarChart = null;
 let planIdSeq = 1;
+
+/* =====================================================================
+   CONEXÃO COM O GOOGLE SHEETS (planilha como fonte dos dados)
+   ---------------------------------------------------------------------
+   Preencha os 3 links abaixo depois de publicar sua planilha
+   (Arquivo > Compartilhar > Publicar na Web, formato CSV, uma aba por vez).
+   Deixe em branco para continuar usando os dados de exemplo.
+   ===================================================================== */
+const SHEET_CONFIG = {
+  employeesCsvUrl: '',   // link CSV publicado da aba "Colaboradores"
+  planCsvUrl: '',        // link CSV publicado da aba "Plano de Desenvolvimento"
+  sheetEditUrl: '',      // link normal (de edição) da planilha, para o botão "Abrir planilha"
+};
+
+const BASE_HEADERS = ['Nome','Cargo','Área','Avaliador','Data da Avaliação','Tempo na Função','Status da Avaliação','URL da Foto'];
+
+function slugify(name){
+  return name.trim().toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+    .replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,'');
+}
+function findCompetencyByName(text){
+  const t = (text||'').trim().toLowerCase();
+  return ALL_COMPETENCIES.find(c => c.name.trim().toLowerCase() === t);
+}
+function parseScoreCell(v){
+  const n = parseInt(String(v).trim(), 10);
+  if(!Number.isFinite(n)) return 3;
+  return Math.max(1, Math.min(5, n));
+}
+
+function parseEmployeesCsv(csvText){
+  const parsed = Papa.parse(csvText, { header:true, skipEmptyLines:true });
+  return parsed.data
+    .filter(row => (row['Nome']||'').trim())
+    .map(row => {
+      const name = row['Nome'].trim();
+      const scoresByComp = {};
+      ALL_COMPETENCIES.forEach(c => { scoresByComp[c.id] = parseScoreCell(row[c.name]); });
+      return {
+        id: slugify(name),
+        name,
+        cargo: (row['Cargo']||'').trim() || 'Não informado',
+        area: (row['Área']||'').trim() || 'Não informado',
+        avaliador: (row['Avaliador']||'').trim() || 'Não informado',
+        dataAvaliacao: (row['Data da Avaliação']||'').trim(),
+        tempoFuncao: (row['Tempo na Função']||'').trim() || 'Não informado',
+        status: (row['Status da Avaliação']||'').trim() || 'Pendente',
+        photo: (row['URL da Foto']||'').trim() || null,
+        scoresByComp,
+        plan: [],
+      };
+    });
+}
+
+function parsePlanCsv(csvText, employees){
+  const parsed = Papa.parse(csvText, { header:true, skipEmptyLines:true });
+  parsed.data.forEach(row => {
+    const empName = (row['Nome do Colaborador']||row['Nome']||'').trim();
+    const compName = (row['Competência']||row['Competencia']||'').trim();
+    if(!empName || !compName) return;
+    const emp = employees.find(e => e.id === slugify(empName));
+    const comp = findCompetencyByName(compName);
+    if(!emp || !comp) return;
+    emp.plan.push({
+      id:'plan-'+(planIdSeq++), competencyId:comp.id,
+      action:(row['Ação de Desenvolvimento']||row['Acao de Desenvolvimento']||'').trim(),
+      responsible:(row['Responsável']||row['Responsavel']||'').trim(),
+      deadline:(row['Prazo']||'').trim(),
+      status:(row['Status']||'Não iniciado').trim(),
+      observation:(row['Observação']||row['Observacao']||'').trim(),
+      auto:false,
+    });
+  });
+}
+
+function sheetsConfigured(){
+  return !!(SHEET_CONFIG.employeesCsvUrl && SHEET_CONFIG.employeesCsvUrl.trim());
+}
+
+async function loadFromSheets(manual){
+  if(!sheetsConfigured()){
+    state.dataSource = 'demo';
+    renderSyncPanel();
+    return;
+  }
+  state.syncing = true; state.syncError = null;
+  renderSyncPanel();
+  try{
+    const empRes = await fetch(SHEET_CONFIG.employeesCsvUrl, { cache:'no-store' });
+    if(!empRes.ok) throw new Error('Não foi possível ler a aba de colaboradores (HTTP '+empRes.status+').');
+    const empCsv = await empRes.text();
+    const employees = parseEmployeesCsv(empCsv);
+    if(employees.length === 0) throw new Error('A aba de colaboradores foi lida, mas nenhuma linha com "Nome" preenchido foi encontrada.');
+
+    if(SHEET_CONFIG.planCsvUrl && SHEET_CONFIG.planCsvUrl.trim()){
+      const planRes = await fetch(SHEET_CONFIG.planCsvUrl, { cache:'no-store' });
+      if(planRes.ok){
+        const planCsv = await planRes.text();
+        parsePlanCsv(planCsv, employees);
+      }
+    }
+    employees.forEach(ensureAutoPlanEntries);
+
+    state.employees = employees;
+    state.dataSource = 'sheet';
+    state.lastSync = new Date();
+    state.syncError = null;
+    if(state.view==='detail' && !employees.some(e=>e.id===state.currentId)) state.view='employees';
+  } catch(err){
+    state.syncError = err.message || 'Falha ao carregar a planilha.';
+  } finally {
+    state.syncing = false;
+    renderSyncPanel();
+    refreshCurrentView();
+  }
+}
+
+function refreshCurrentView(){
+  if(state.view==='overview') renderOverview();
+  else if(state.view==='employees') renderEmployeeGrid();
+  else if(state.view==='detail') renderDetail(state.currentId);
+  renderTopbar();
+}
+
+function openSheetLink(){
+  if(SHEET_CONFIG.sheetEditUrl && SHEET_CONFIG.sheetEditUrl.trim()){
+    window.open(SHEET_CONFIG.sheetEditUrl, '_blank');
+  } else {
+    alert('O link de edição da planilha ainda não foi configurado neste dashboard (SHEET_CONFIG.sheetEditUrl).');
+  }
+}
+
+function renderSyncPanel(){
+  const el = document.getElementById('sync-panel');
+  if(!el) return;
+  let dotClass='off', pillClass='off', label='Dados de exemplo';
+  if(state.syncing){ dotClass='off'; pillClass='off'; label='Atualizando...'; }
+  else if(state.syncError){ dotClass='err'; pillClass='err'; label='Erro ao conectar'; }
+  else if(state.dataSource==='sheet'){ dotClass='on'; pillClass='on'; label='Planilha conectada'; }
+
+  const lastSyncTxt = state.lastSync ? state.lastSync.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}) : null;
+
+  el.innerHTML = `
+    <div class="sync-pill ${pillClass}"><span class="sync-dot ${dotClass}"></span>${label}</div>
+    <div class="sync-note">
+      ${state.syncError ? esc(state.syncError) : ''}
+      ${!state.syncError && state.dataSource==='sheet' && lastSyncTxt ? 'Última atualização: '+lastSyncTxt : ''}
+      ${!state.syncError && state.dataSource==='demo' ? 'Configure os links da planilha em SHEET_CONFIG, no código, para conectar dados reais.' : ''}
+    </div>
+    <div class="sync-actions">
+      ${sheetsConfigured() ? `
+      <button class="sync-btn primary" onclick="loadFromSheets(true)">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg>
+        Atualizar dados
+      </button>` : ''}
+      <button class="sync-btn" onclick="openSheetLink()">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6"/><path d="M10 14 21 3"/></svg>
+        Abrir planilha
+      </button>
+    </div>
+  `;
+}
 
 function esc(s){
   if(s===null||s===undefined) return '';
@@ -748,9 +932,9 @@ function renderTopbar(){
     topbar.innerHTML = `
       <h2>Visão geral</h2>
       <div class="topbar-spacer"></div>
-      <button class="btn btn-primary" onclick="openAddEmployeeModal()">
-        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
-        Novo colaborador
+      <button class="btn btn-ghost" onclick="openSheetLink()">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6"/><path d="M10 14 21 3"/></svg>
+        Abrir planilha
       </button>`;
   } else if(state.view==='employees'){
     topbar.innerHTML = `
@@ -760,16 +944,16 @@ function renderTopbar(){
         <input type="text" placeholder="Buscar por nome..." value="${esc(state.search)}" oninput="setSearch(this.value)"/>
       </div>
       <div class="topbar-spacer"></div>
-      <button class="btn btn-primary" onclick="openAddEmployeeModal()">
-        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
-        Novo colaborador
+      <button class="btn btn-ghost" onclick="openSheetLink()">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6"/><path d="M10 14 21 3"/></svg>
+        Abrir planilha
       </button>`;
   } else {
     const emp = state.employees.find(e=>e.id===state.currentId);
     topbar.innerHTML = `
       <h2>${emp?esc(emp.name):'Perfil'}</h2>
       <div class="topbar-spacer"></div>
-      <button class="btn btn-ghost btn-sm" onclick="openEditEmployeeModal('${emp.id}')">Editar dados</button>`;
+      <button class="btn btn-ghost btn-sm" onclick="openSheetLink()">Editar na planilha</button>`;
   }
 }
 
@@ -974,9 +1158,6 @@ function renderDetail(id){
     <div class="card detail-header">
       <div class="photo-wrap">
         ${avatarHtml(emp,92)}
-        <div class="photo-edit-btn" onclick="triggerPhotoUpload('${emp.id}')" title="Alterar foto">
-          <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2Z"/><circle cx="12" cy="13" r="3.5"/></svg>
-        </div>
       </div>
       <div class="detail-id">
         <h3>${esc(emp.name)}</h3>
@@ -985,11 +1166,7 @@ function renderDetail(id){
           <div class="meta-item"><div class="k">Avaliador</div><div class="v">${esc(emp.avaliador)}</div></div>
           <div class="meta-item"><div class="k">Data da avaliação</div><div class="v">${formatDateBR(emp.dataAvaliacao)}</div></div>
           <div class="meta-item"><div class="k">Tempo na função</div><div class="v">${esc(emp.tempoFuncao)}</div></div>
-          <div class="meta-item"><div class="k">Status da avaliação</div>
-            <select onchange="updateEmployeeField('${emp.id}','status',this.value)">
-              ${['Concluída','Em andamento','Pendente'].map(s=>`<option ${emp.status===s?'selected':''}>${s}</option>`).join('')}
-            </select>
-          </div>
+          <div class="meta-item"><div class="k">Status da avaliação</div><div class="v">${esc(emp.status)}</div></div>
         </div>
       </div>
       <div class="score-badge-lg" style="background:var(--${cv}-bg);">
@@ -1035,7 +1212,7 @@ function renderDetail(id){
             <div class="comp-row">
               <div class="cname">${esc(c.name)}</div>
               <div class="bar-track"><div class="bar-fill" style="width:${sc/5*100}%; background:var(--${ccv});"></div></div>
-              <div class="comp-badge" style="background:var(--${ccv}-bg); color:var(--${ccv});" title="${esc(levelDesc(c.id,sc))}" onclick="openScoreEditor('${emp.id}','${c.id}')">${sc}</div>
+              <div class="comp-badge" style="background:var(--${ccv}-bg); color:var(--${ccv});" title="${esc(levelDesc(c.id,sc))}" onclick="openScoreInfo('${emp.id}','${c.id}')">${sc}</div>
             </div>`;
           }).join('')}
         </div>`;
@@ -1062,12 +1239,12 @@ function renderDetail(id){
     <div class="card panel">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
         <h4 style="margin:0;">Plano de desenvolvimento</h4>
-        <button class="btn btn-ghost btn-sm" onclick="openAddPlanModal('${emp.id}')">+ Adicionar ação</button>
+        <button class="btn btn-ghost btn-sm" onclick="openSheetLink()">Editar na planilha</button>
       </div>
-      <p class="section-sub">Competências com nota abaixo de 3 são sinalizadas automaticamente como oportunidade de desenvolvimento.</p>
+      <p class="section-sub">Competências com nota abaixo de 3 são sinalizadas automaticamente. Ações marcadas como <b>sugestão</b> ainda não foram registradas na aba "Plano de Desenvolvimento" da planilha.</p>
       ${emp.plan.length ? `
       <table class="plan-table">
-        <thead><tr><th style="width:20%;">Competência</th><th style="width:24%;">Ação de desenvolvimento</th><th style="width:14%;">Responsável</th><th style="width:11%;">Prazo</th><th style="width:13%;">Status</th><th style="width:14%;">Observação</th><th></th></tr></thead>
+        <thead><tr><th style="width:19%;">Competência</th><th style="width:23%;">Ação de desenvolvimento</th><th style="width:13%;">Responsável</th><th style="width:10%;">Prazo</th><th style="width:13%;">Status</th><th style="width:14%;">Observação</th><th style="width:8%;"></th></tr></thead>
         <tbody>
           ${emp.plan.map(pl => {
             const comp = ALL_COMPETENCIES.find(c=>c.id===pl.competencyId);
@@ -1078,14 +1255,12 @@ function renderDetail(id){
                 <div class="plan-comp-name">${comp?esc(comp.name):'-'}</div>
                 <div class="plan-comp-level">${sc!==null?'Nível atual: '+sc+' — '+LEVELS[sc].name:''}</div>
               </td>
-              <td><textarea onchange="updatePlanField('${emp.id}','${pl.id}','action',this.value)">${esc(pl.action)}</textarea></td>
-              <td><input type="text" placeholder="Nome" value="${esc(pl.responsible)}" onchange="updatePlanField('${emp.id}','${pl.id}','responsible',this.value)"/></td>
-              <td><input type="date" value="${esc(pl.deadline)}" onchange="updatePlanField('${emp.id}','${pl.id}','deadline',this.value)"/></td>
-              <td><select onchange="updatePlanField('${emp.id}','${pl.id}','status',this.value)">
-                ${['Não iniciado','Em andamento','Concluído'].map(s=>`<option ${pl.status===s?'selected':''}>${s}</option>`).join('')}
-              </select></td>
-              <td><input type="text" placeholder="Opcional" value="${esc(pl.observation)}" onchange="updatePlanField('${emp.id}','${pl.id}','observation',this.value)"/></td>
-              <td><button class="btn-danger-text" onclick="removePlanEntry('${emp.id}','${pl.id}')">Remover</button></td>
+              <td>${esc(pl.action) || '-'}</td>
+              <td>${esc(pl.responsible) || '-'}</td>
+              <td>${pl.deadline ? formatDateBR(pl.deadline) : '-'}</td>
+              <td>${esc(pl.status) || '-'}</td>
+              <td>${esc(pl.observation) || '-'}</td>
+              <td>${pl.auto ? '<span class="tag" style="background:var(--l2-bg); color:var(--l2); border-color:transparent;">Sugestão</span>' : '<span class="tag" style="background:var(--l4-bg); color:var(--accent-dark); border-color:transparent;">Na planilha</span>'}</td>
             </tr>`;
           }).join('')}
         </tbody>
@@ -1130,69 +1305,12 @@ function drawRadar(emp, pAvgs){
 }
 
 /* =====================================================================
-   AÇÕES: FOTO, EDIÇÃO DE FUNCIONÁRIO, NOTAS, PLANO
-   ===================================================================== */
-
-let pendingPhotoTarget = null; // 'new' or employee id
-
-function triggerPhotoUpload(empId){
-  pendingPhotoTarget = empId;
-  document.getElementById('hidden-photo-input').click();
-}
-function handlePhotoFile(evt){
-  const file = evt.target.files[0];
-  if(!file) return;
-  const reader = new FileReader();
-  reader.onload = function(e){
-    if(pendingPhotoTarget==='new-employee-form'){
-      window.__newEmployeePhoto = e.target.result;
-      const prev = document.getElementById('new-emp-photo-preview');
-      if(prev) prev.innerHTML = `<img src="${e.target.result}" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%;">`;
-    } else {
-      const emp = state.employees.find(x=>x.id===pendingPhotoTarget);
-      if(emp){ emp.photo = e.target.result; renderDetail(emp.id); }
-    }
-  };
-  reader.readAsDataURL(file);
-  evt.target.value = '';
-}
-
-function updateEmployeeField(empId, field, value){
-  const emp = state.employees.find(e=>e.id===empId);
-  if(!emp) return;
-  emp[field] = value;
-  if(state.view==='detail') renderDetail(empId);
-}
-
-function setScore(empId, compId, level){
-  const emp = state.employees.find(e=>e.id===empId);
-  if(!emp) return;
-  emp.scoresByComp[compId] = level;
-  closeModal();
-  renderDetail(empId);
-  if(state.view==='employees') renderEmployeeGrid();
-}
-
-function updatePlanField(empId, planId, field, value){
-  const emp = state.employees.find(e=>e.id===empId);
-  if(!emp) return;
-  const entry = emp.plan.find(p=>p.id===planId);
-  if(entry){ entry[field]=value; entry.auto=false; }
-}
-function removePlanEntry(empId, planId){
-  const emp = state.employees.find(e=>e.id===empId);
-  if(!emp) return;
-  emp.plan = emp.plan.filter(p=>p.id!==planId);
-  renderDetail(empId);
-}
-
-/* =====================================================================
-   MODAIS
+   MODAL: INFORMAÇÃO DE NÍVEL (somente leitura — a edição acontece na planilha)
    ===================================================================== */
 
 function closeModal(){ document.getElementById('modal-root').innerHTML=''; }
 
-function openScoreEditor(empId, compId){
+function openScoreInfo(empId, compId){
   const emp = state.employees.find(e=>e.id===empId);
   const comp = ALL_COMPETENCIES.find(c=>c.id===compId);
   const current = compScore(emp, compId);
@@ -1202,12 +1320,12 @@ function openScoreEditor(empId, compId){
       <div class="modal-head">
         <div>
           <h3>${esc(comp.name)}</h3>
-          <p>Selecione o nível de proficiência que melhor representa a atuação de ${esc(emp.name.split(' ')[0])}.</p>
+          <p>Nível atual de ${esc(emp.name.split(' ')[0])}: <b>${current} — ${esc(LEVELS[current].name)}</b>. Para alterar, edite a nota na planilha conectada.</p>
         </div>
         <button class="modal-close" onclick="closeModal()"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
       </div>
       ${[1,2,3,4,5].map(lv => `
-        <div class="level-option ${lv===current?'selected':''}" onclick="setScore('${empId}','${compId}',${lv})">
+        <div class="level-option ${lv===current?'selected':''}" style="cursor:default;">
           <div class="level-num" style="background:var(--${levelColorVar(lv)}-bg); color:var(--${levelColorVar(lv)});">${lv}</div>
           <div class="level-txt">
             <div class="lt">${LEVELS[lv].name}</div>
@@ -1215,153 +1333,21 @@ function openScoreEditor(empId, compId){
           </div>
         </div>
       `).join('')}
-    </div>
-  </div>`;
-  document.getElementById('modal-root').innerHTML = html;
-}
-
-function openAddEmployeeModal(){
-  window.__newEmployeePhoto = null;
-  const html = `
-  <div class="modal-overlay" onclick="if(event.target===this) closeModal()">
-    <div class="modal-box">
-      <div class="modal-head">
-        <div>
-          <h3>Novo colaborador</h3>
-          <p>Cadastre os dados básicos. As competências começam no nível 3 (Operacional) e podem ser ajustadas no perfil.</p>
-        </div>
-        <button class="modal-close" onclick="closeModal()"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
-      </div>
-      <div class="photo-picker" style="margin-bottom:16px;">
-        <div class="avatar" id="new-emp-photo-preview" style="width:56px;height:56px;background:var(--surface-alt);color:var(--ink-300);">＋</div>
-        <button type="button" class="btn btn-ghost btn-sm" onclick="pendingPhotoTarget='new-employee-form'; document.getElementById('hidden-photo-input').click();">Adicionar foto</button>
-      </div>
-      <div class="form-grid">
-        <div class="form-field full"><label>Nome completo</label><input type="text" id="f-name" placeholder="Ex.: Ana Paula Souza"></div>
-        <div class="form-field"><label>Cargo</label><input type="text" id="f-cargo" placeholder="Ex.: Supervisor(a) de Armazém"></div>
-        <div class="form-field"><label>Área</label><input type="text" id="f-area" placeholder="Ex.: Armazenagem"></div>
-        <div class="form-field"><label>Avaliador</label><input type="text" id="f-avaliador" placeholder="Ex.: Diretoria de Operações"></div>
-        <div class="form-field"><label>Data da avaliação</label><input type="date" id="f-data" value="${new Date().toISOString().slice(0,10)}"></div>
-        <div class="form-field"><label>Tempo na função</label><input type="text" id="f-tempo" placeholder="Ex.: 2 anos"></div>
-        <div class="form-field"><label>Status da avaliação</label>
-          <select id="f-status"><option>Em andamento</option><option>Concluída</option><option>Pendente</option></select>
-        </div>
-      </div>
       <div class="modal-actions">
-        <button class="btn btn-ghost" onclick="closeModal()">Cancelar</button>
-        <button class="btn btn-primary" onclick="submitNewEmployee()">Cadastrar colaborador</button>
+        <button class="btn btn-ghost" onclick="closeModal()">Fechar</button>
+        <button class="btn btn-primary" onclick="closeModal(); openSheetLink();">Editar na planilha</button>
       </div>
     </div>
   </div>`;
   document.getElementById('modal-root').innerHTML = html;
-}
-
-function submitNewEmployee(){
-  const name = document.getElementById('f-name').value.trim();
-  if(!name){ alert('Informe o nome do colaborador.'); return; }
-  const baseScores = {};
-  ALL_COMPETENCIES.forEach(c => baseScores[c.id] = 3);
-  const emp = {
-    id:'emp-'+Date.now(),
-    name,
-    cargo: document.getElementById('f-cargo').value.trim() || 'Não informado',
-    area: document.getElementById('f-area').value.trim() || 'Não informado',
-    avaliador: document.getElementById('f-avaliador').value.trim() || 'Não informado',
-    dataAvaliacao: document.getElementById('f-data').value,
-    tempoFuncao: document.getElementById('f-tempo').value.trim() || 'Não informado',
-    status: document.getElementById('f-status').value,
-    photo: window.__newEmployeePhoto || null,
-    scoresByComp: baseScores,
-    plan: [],
-  };
-  state.employees.push(emp);
-  closeModal();
-  navigate('detail', emp.id);
-}
-
-function openEditEmployeeModal(empId){
-  const emp = state.employees.find(e=>e.id===empId);
-  const html = `
-  <div class="modal-overlay" onclick="if(event.target===this) closeModal()">
-    <div class="modal-box">
-      <div class="modal-head">
-        <div><h3>Editar dados</h3><p>Atualize as informações cadastrais de ${esc(emp.name)}.</p></div>
-        <button class="modal-close" onclick="closeModal()"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
-      </div>
-      <div class="form-grid">
-        <div class="form-field full"><label>Nome completo</label><input type="text" id="ef-name" value="${esc(emp.name)}"></div>
-        <div class="form-field"><label>Cargo</label><input type="text" id="ef-cargo" value="${esc(emp.cargo)}"></div>
-        <div class="form-field"><label>Área</label><input type="text" id="ef-area" value="${esc(emp.area)}"></div>
-        <div class="form-field"><label>Avaliador</label><input type="text" id="ef-avaliador" value="${esc(emp.avaliador)}"></div>
-        <div class="form-field"><label>Data da avaliação</label><input type="date" id="ef-data" value="${esc(emp.dataAvaliacao)}"></div>
-        <div class="form-field"><label>Tempo na função</label><input type="text" id="ef-tempo" value="${esc(emp.tempoFuncao)}"></div>
-      </div>
-      <div class="modal-actions">
-        <button class="btn btn-ghost" onclick="closeModal()">Cancelar</button>
-        <button class="btn btn-primary" onclick="submitEditEmployee('${empId}')">Salvar alterações</button>
-      </div>
-    </div>
-  </div>`;
-  document.getElementById('modal-root').innerHTML = html;
-}
-function submitEditEmployee(empId){
-  const emp = state.employees.find(e=>e.id===empId);
-  emp.name = document.getElementById('ef-name').value.trim() || emp.name;
-  emp.cargo = document.getElementById('ef-cargo').value.trim();
-  emp.area = document.getElementById('ef-area').value.trim();
-  emp.avaliador = document.getElementById('ef-avaliador').value.trim();
-  emp.dataAvaliacao = document.getElementById('ef-data').value;
-  emp.tempoFuncao = document.getElementById('ef-tempo').value.trim();
-  closeModal();
-  renderDetail(empId);
-}
-
-function openAddPlanModal(empId){
-  const emp = state.employees.find(e=>e.id===empId);
-  const options = ALL_COMPETENCIES.map(c=>`<option value="${c.id}">${esc(c.name)} (nível atual: ${compScore(emp,c.id)})</option>`).join('');
-  const html = `
-  <div class="modal-overlay" onclick="if(event.target===this) closeModal()">
-    <div class="modal-box wide">
-      <div class="modal-head">
-        <div><h3>Adicionar ação de desenvolvimento</h3><p>Vincule uma ação a qualquer competência de ${esc(emp.name)}.</p></div>
-        <button class="modal-close" onclick="closeModal()"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
-      </div>
-      <div class="form-grid">
-        <div class="form-field full"><label>Competência</label><select id="pf-comp">${options}</select></div>
-        <div class="form-field full"><label>Ação de desenvolvimento</label><input type="text" id="pf-action" placeholder="Ex.: Treinamento em..."></div>
-        <div class="form-field"><label>Responsável</label><input type="text" id="pf-resp" placeholder="Nome do responsável"></div>
-        <div class="form-field"><label>Prazo</label><input type="date" id="pf-deadline"></div>
-        <div class="form-field"><label>Status</label><select id="pf-status"><option>Não iniciado</option><option>Em andamento</option><option>Concluído</option></select></div>
-        <div class="form-field"><label>Observação</label><input type="text" id="pf-obs" placeholder="Opcional"></div>
-      </div>
-      <div class="modal-actions">
-        <button class="btn btn-ghost" onclick="closeModal()">Cancelar</button>
-        <button class="btn btn-primary" onclick="submitAddPlan('${empId}')">Adicionar ao plano</button>
-      </div>
-    </div>
-  </div>`;
-  document.getElementById('modal-root').innerHTML = html;
-}
-function submitAddPlan(empId){
-  const emp = state.employees.find(e=>e.id===empId);
-  const compId = document.getElementById('pf-comp').value;
-  const action = document.getElementById('pf-action').value.trim() || suggestedAction(compId, ALL_COMPETENCIES.find(c=>c.id===compId).name);
-  emp.plan.push({
-    id:'plan-'+(planIdSeq++), competencyId:compId, action,
-    responsible: document.getElementById('pf-resp').value.trim(),
-    deadline: document.getElementById('pf-deadline').value,
-    status: document.getElementById('pf-status').value,
-    observation: document.getElementById('pf-obs').value.trim(),
-    auto:false,
-  });
-  closeModal();
-  renderDetail(empId);
 }
 
 /* =====================================================================
    INICIALIZAÇÃO
    ===================================================================== */
 navigate('overview');
+renderSyncPanel();
+loadFromSheets();
 </script>
 </body>
 </html>

@@ -148,6 +148,19 @@
 
   .grid-2{display:grid;grid-template-columns:1.3fr 1fr;gap:16px;align-items:start;}
 
+  .insight-card{
+    display:flex; gap:14px; align-items:flex-start; padding:16px 20px; border-radius:var(--radius-lg);
+    background:linear-gradient(135deg, var(--accent-soft) 0%, var(--surface) 70%);
+    border:1px solid var(--line); margin-bottom:20px;
+  }
+  .insight-card .ic{
+    width:34px;height:34px;border-radius:9px;background:var(--accent);display:flex;align-items:center;justify-content:center;flex:none;
+  }
+  .insight-card .ic svg{width:18px;height:18px;stroke:#fff;}
+  .insight-card .body{flex:1;}
+  .insight-card .eyebrow{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;color:var(--accent-dark);margin-bottom:5px;}
+  .insight-card p{margin:0;font-size:13.5px;line-height:1.6;color:var(--ink-800);}
+
   .pillar-bars{display:flex;flex-direction:column;gap:12px;}
   .pillar-bar-row{display:grid;grid-template-columns:170px 1fr 42px;align-items:center;gap:12px;}
   .pillar-bar-row .name{font-size:13px;font-weight:700;color:var(--ink-700);}
@@ -896,6 +909,86 @@ function developmentPriorityPillar(emp){
   return avgs.reduce((min,a)=> a.avg<min.avg? a : min, avgs[0]);
 }
 
+/* ---------- leituras automáticas em texto (equipe e indivíduo) ---------- */
+
+function joinList(items){
+  if(items.length===0) return '';
+  if(items.length===1) return items[0];
+  if(items.length===2) return items[0]+' e '+items[1];
+  return items.slice(0,-1).join(', ')+' e '+items[items.length-1];
+}
+
+function generateTeamInsight(){
+  const emps = state.employees;
+  if(emps.length===0) return '';
+
+  const pAvgs = PILLARS.map(p => ({ name:p.name, id:p.id, avg: emps.reduce((s,e)=>s+pillarAverage(e,p.id),0)/emps.length }));
+  const top = pAvgs.reduce((a,b)=> b.avg>a.avg ? b : a, pAvgs[0]);
+  const bottom = pAvgs.reduce((a,b)=> b.avg<a.avg ? b : a, pAvgs[0]);
+  const overall = emps.reduce((s,e)=>s+overallScore(e),0)/emps.length;
+  const totalGaps = emps.reduce((s,e)=>s+countBelow3(e),0);
+  const pctExpected = emps.filter(e=>overallScore(e)>=3).length / emps.length;
+
+  const gapCountByPillar = {};
+  PILLARS.forEach(p => gapCountByPillar[p.id]=0);
+  emps.forEach(e => gaps(e).forEach(g => gapCountByPillar[g.pillarId]++));
+  const worstGapPillarId = Object.entries(gapCountByPillar).sort((a,b)=>b[1]-a[1])[0][0];
+  const worstGapPillar = PILLARS.find(p=>p.id===worstGapPillarId);
+  const worstGapCount = gapCountByPillar[worstGapPillarId];
+
+  const sentences = [];
+
+  if(top.avg - bottom.avg < 0.5){
+    sentences.push(`Com base nos dados, as competências da liderança estão bem equilibradas entre os pilares, sem um ponto fraco coletivo evidente (média geral de ${fmt1(overall)}).`);
+  } else {
+    sentences.push(`Com base nos dados, sua liderança é mais forte em ${top.name} (média ${fmt1(top.avg)}) do que em ${bottom.name} (média ${fmt1(bottom.avg)}).`);
+  }
+
+  if(overall>=4) sentences.push(`No geral, o grupo está em nível avançado (média ${fmt1(overall)}).`);
+  else if(overall>=3.5) sentences.push(`No geral, o grupo está acima do nível esperado (média ${fmt1(overall)}).`);
+  else if(overall>=3) sentences.push(`No geral, o grupo está dentro do nível esperado (média ${fmt1(overall)}) — no conjunto, você tem uma boa equipe.`);
+  else if(overall>=2.5) sentences.push(`No geral, o grupo está um pouco abaixo do nível esperado (média ${fmt1(overall)}) e pode se beneficiar de atenção.`);
+  else sentences.push(`No geral, o grupo está abaixo do nível esperado (média ${fmt1(overall)}) e precisa de atenção prioritária.`);
+
+  const pct = Math.round(pctExpected*100);
+  if(pctExpected>=0.8) sentences.push(`${pct}% dos líderes já estão no nível esperado ou acima — sinal de uma equipe consistente.`);
+  else if(pctExpected>=0.5) sentences.push(`${pct}% dos líderes estão no nível esperado ou acima; ainda há uma parcela relevante abaixo disso.`);
+  else sentences.push(`Apenas ${pct}% dos líderes estão no nível esperado ou acima — vale priorizar isso no plano de desenvolvimento.`);
+
+  if(totalGaps>0){
+    sentences.push(`Ao todo, ${totalGaps} competência(s) estão abaixo do nível 3 entre os ${emps.length} líderes, concentradas principalmente em ${worstGapPillar.name} (${worstGapCount} ocorrência(s)).`);
+  }
+
+  return sentences.join(' ');
+}
+
+function generateEmployeeInsight(emp){
+  const firstName = emp.name.split(' ')[0];
+  const prof = classifyProfile(emp);
+  const profShort = prof.name.replace(/^Perfil\s+/i,'');
+  const overall = overallScore(emp);
+  const strong = strengths(emp,1)[0];
+  const gapList = gaps(emp);
+
+  const sentences = [];
+  sentences.push(`Com base nas notas, ${firstName} tem um perfil predominantemente ${profShort} (média geral ${fmt1(overall)}).`);
+
+  if(strong) sentences.push(`O ponto mais forte é ${strong.name} (nível ${strong.score} — ${LEVELS[strong.score].name}).`);
+
+  if(gapList.length===0){
+    sentences.push(`Não há competências abaixo do nível esperado no momento.`);
+  } else if(gapList.length===1){
+    sentences.push(`O principal ponto de desenvolvimento é ${gapList[0].name} (nível ${gapList[0].score}).`);
+  } else if(gapList.length<=3){
+    sentences.push(`Os principais pontos de desenvolvimento são ${joinList(gapList.map(g=>g.name))} — todos abaixo do nível esperado.`);
+  } else {
+    const top3 = joinList(gapList.slice(0,3).map(g=>g.name));
+    sentences.push(`Há ${gapList.length} competências abaixo do nível esperado, com destaque para ${top3}. Vale priorizar essas no plano de desenvolvimento.`);
+  }
+
+  return sentences.join(' ');
+}
+
 function ensureAutoPlanEntries(emp){
   const gapList = gaps(emp);
   gapList.forEach(g => {
@@ -978,7 +1071,15 @@ function renderOverview(){
   const priorityRanking = [...emps].sort((a,b)=>countBelow3(b)-countBelow3(a)).filter(e=>countBelow3(e)>0).slice(0,5);
 
   root.innerHTML = `
-    <p class="section-sub" style="margin-bottom:20px;max-width:760px;">Panorama consolidado da liderança logística. Os indicadores abaixo refletem a média entre todos os líderes avaliados e servem como referência para decisões de desenvolvimento — não para comparação individual entre pessoas.</p>
+    <p class="section-sub" style="margin-bottom:16px;max-width:760px;">Panorama consolidado da liderança logística. Os indicadores abaixo refletem a média entre todos os líderes avaliados e servem como referência para decisões de desenvolvimento — não para comparação individual entre pessoas.</p>
+
+    <div class="insight-card">
+      <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M12 2a6.5 6.5 0 0 0-4 11.6c.6.5 1 1.3 1 2.1V16h6v-.3c0-.8.4-1.6 1-2.1A6.5 6.5 0 0 0 12 2Z"/></svg></div>
+      <div class="body">
+        <div class="eyebrow">Leitura automática</div>
+        <p>${generateTeamInsight()}</p>
+      </div>
+    </div>
 
     <div class="kpi-grid">
       <div class="kpi">
@@ -1183,7 +1284,7 @@ function renderDetail(id){
       </div>
       <div class="card panel">
         <h4>Leitura automática do perfil</h4>
-        <p style="font-size:13px;color:var(--ink-600,#4a5560);margin-top:0;">${esc(prof.desc)}</p>
+        <p class="profile-insight" style="font-size:13.5px;line-height:1.6;color:var(--ink-800);margin-top:0;">${generateEmployeeInsight(emp)}</p>
         <div style="display:flex;flex-direction:column;gap:10px;margin-top:14px;">
           <div class="sg-list"><li><span>Maior competência</span><span class="n">${strong[0]?esc(strong[0].name)+' · '+strong[0].score:'-'}</span></li></div>
           <div class="sg-list"><li><span>Menor competência</span><span class="n">${gapList[0]?esc(gapList[0].name)+' · '+gapList[0].score : (allCompScores(emp).slice().sort((a,b)=>a.score-b.score)[0].name)}</span></li></div>
